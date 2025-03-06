@@ -17,6 +17,8 @@ from rich.markup import escape
 from rich.text import Text
 from rich.live import Live
 import yt_dlp
+import ffmpeg
+import re
 
 __version__ = "0.1.0"  # Update this with your actual version
 
@@ -252,45 +254,84 @@ def add_format_row(table: Table, f: Dict):
     )
 
 def find_best_format(formats: List[Dict]) -> Optional[Dict]:
-    # First try to find a combined format with h.264 1080p and AAC audio
+    """Find the best format following these priorities:
+    1. Best video (highest resolution + bitrate) + Best audio (highest bitrate AAC/best available)
+    2. Will convert to h.264/AAC if needed using high quality settings.
+    """
+    # First separate formats into video and audio
+    video_formats = []
+    audio_formats = []
+    
     for f in formats:
-        if (f.get('vcodec', '').startswith('avc1') and
-            f.get('ext') == 'mp4' and
-            f.get('height', 0) == 1080 and
-            f.get('acodec', 'none') != 'none' and
-            f.get('acodec', '').startswith('mp4a')):  # mp4a is AAC
-            return f
+        vcodec = f.get('vcodec', 'none')
+        acodec = f.get('acodec', 'none')
+        
+        if vcodec != 'none' and acodec == 'none':  # Video-only streams
+            video_formats.append(f)
+        elif vcodec == 'none' and acodec != 'none':  # Audio-only streams
+            audio_formats.append(f)
 
-    # If no combined format found, look for best video and audio separately
-    best_video = None
-    best_audio = None
+    if not video_formats or not audio_formats:
+        console.print("[yellow]Warning:[/yellow] No separate video/audio streams found")
+        return None
 
-    # Find best h.264 1080p video
-    for f in formats:
-        if (f.get('vcodec', '').startswith('avc1') and
-            f.get('ext') == 'mp4' and
-            f.get('height', 0) == 1080 and
-            f.get('acodec', 'none') == 'none'):
-            if not best_video or f.get('tbr', 0) > best_video.get('tbr', 0):
-                best_video = f
+    # Sort video formats by resolution and bitrate
+    video_formats.sort(key=lambda x: (
+        x.get('height', 0) or 0,     # Resolution first
+        x.get('tbr', 0) or 0,        # Then bitrate
+        x.get('vcodec', '').startswith('avc1'),  # Prefer h.264 if same quality
+        x.get('ext') == 'mp4'        # Prefer MP4 if same quality
+    ), reverse=True)
 
-    # Find best AAC audio
-    for f in formats:
-        if (f.get('acodec', 'none') != 'none' and 
-            f.get('vcodec', 'none') == 'none'):
-            # Prefer AAC audio
-            is_aac = f.get('acodec', '').startswith('mp4a')
-            current_is_aac = best_audio and best_audio.get('acodec', '').startswith('mp4a')
-            
-            if not best_audio or (is_aac and not current_is_aac) or (
-                (is_aac == current_is_aac) and f.get('tbr', 0) > best_audio.get('tbr', 0)
-            ):
-                best_audio = f
+    # Sort audio formats by codec and bitrate
+    audio_formats.sort(key=lambda x: (
+        x.get('acodec', '').startswith('mp4a'),  # Prefer AAC
+        x.get('tbr', 0) or 0,                    # Then bitrate
+        x.get('ext') == 'm4a'                    # Prefer M4A container
+    ), reverse=True)
 
-    if best_video and best_audio:
-        return {'format_id': f"{best_video['format_id']}+{best_audio['format_id']}"}
+    # Get best video and audio
+    best_video = video_formats[0]
+    best_audio = audio_formats[0]
 
-    return None
+    # Create combined format with conversion settings if needed
+    combined = {
+        'format_id': f"{best_video['format_id']}+{best_audio['format_id']}",
+        'postprocessors': []
+    }
+
+    # Add video conversion if not h.264/mp4
+    if not best_video.get('vcodec', '').startswith('avc1') or best_video.get('ext') != 'mp4':
+        combined['postprocessors'].append({
+            'key': 'FFmpegVideoConvertor',
+            'preferedformat': 'mp4'
+        })
+        # Add FFmpeg post-processor for high quality conversion
+        combined['postprocessors'].append({
+            'key': 'FFmpeg',
+            'preferredcodec': 'mp4',
+            'postprocessor_args': [
+                '-c:v', 'libx264',
+                '-preset', 'slow',
+                '-crf', '18',
+                '-c:a', 'copy'
+            ]
+        })
+
+    # Add audio conversion if not AAC
+    if not best_audio.get('acodec', '').startswith('mp4a'):
+        combined['postprocessors'].append({
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'aac',
+            'preferredquality': '192',  # High quality AAC
+        })
+
+    # Print selected format details
+    console.print("\n[bold blue]Selected formats:[/bold blue]")
+    console.print(f"• Video: {best_video.get('height', '')}p {best_video.get('vcodec', '')} @ {best_video.get('tbr', '')}Kbps")
+    console.print(f"• Audio: {best_audio.get('acodec', '')} @ {best_audio.get('tbr', '')}Kbps")
+    
+    return combined
 
 def select_format(url: str) -> Optional[Tuple[str, Dict]]:
     """Get format information and let user select one"""
@@ -334,10 +375,11 @@ class DownloadProgress:
         self.completed = False
         self.task = None
         self.current_stage = None
-        # Track both streams
         self.streams = {}
         self.total_bytes = 0
         self.downloaded_bytes = 0
+        self.current_filename = None
+        self.format_info = None
     
     def __enter__(self):
         return self
@@ -345,19 +387,54 @@ class DownloadProgress:
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.task:
             progress.remove_task(self.task)
+            
+        # Show final error if download didn't complete
+        if not self.completed and self.error:
+            console.print(f"\n[red]Download failed:[/red] {self.error}")
+            if self.current_filename:
+                console.print(f"[red]Failed file:[/red] {self.current_filename}")
 
     def download_hook(self, d):
         status = d['status']
         
         if status == 'error':
             self.error = d.get('error', 'Unknown error')
+            error_msg = f"[bold red]Error: {escape(str(self.error))}"
+            if self.current_filename:
+                error_msg += f"\nFile: {self.current_filename}"
             if self.task:
-                progress.update(self.task, description=f"[bold red]Error: {escape(str(self.error))}")
+                progress.update(self.task, description=error_msg)
             return
 
         if status == 'downloading':
-            # Get unique stream identifier
-            stream_id = d.get('info_dict', {}).get('format_id', 'unknown')
+            # Get unique stream identifier and format info
+            info_dict = d.get('info_dict', {})
+            stream_id = info_dict.get('format_id', 'unknown')
+            
+            # Update format info if not set
+            if not self.format_info and info_dict:
+                vcodec = info_dict.get('vcodec', 'none')
+                acodec = info_dict.get('acodec', 'none')
+                height = info_dict.get('height')
+                format_note = info_dict.get('format_note', '')
+                
+                format_parts = []
+                if vcodec != 'none':
+                    if height:
+                        format_parts.append(f"{height}p")
+                    if 'avc1' in vcodec:
+                        format_parts.append('h.264')
+                    elif vcodec != 'none':
+                        format_parts.append(vcodec)
+                if acodec != 'none':
+                    if 'mp4a' in acodec:
+                        format_parts.append('AAC audio')
+                    else:
+                        format_parts.append(f"{acodec} audio")
+                if format_note:
+                    format_parts.append(format_note)
+                
+                self.format_info = ' | '.join(format_parts)
             
             if not self.task or self.current_stage != 'downloading':
                 if self.task:
@@ -365,6 +442,13 @@ class DownloadProgress:
                 self.streams.clear()
                 self.total_bytes = 0
                 self.downloaded_bytes = 0
+                self.current_filename = d.get('filename')
+                
+                # Show initial download info
+                console.print(f"\n[bold blue]Downloading:[/bold blue] {self.current_filename}")
+                if self.format_info:
+                    console.print(f"[bold blue]Format:[/bold blue] {self.format_info}")
+                
                 self.task = progress.add_task(
                     "[bold blue]Starting download...",
                     total=100,  # Use percentage for combined progress
@@ -373,7 +457,6 @@ class DownloadProgress:
             
             # Update stream info
             if stream_id not in self.streams:
-                # Get total bytes, preferring total_bytes over total_bytes_estimate
                 total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
                 self.streams[stream_id] = {
                     'total': total,
@@ -388,7 +471,6 @@ class DownloadProgress:
             if new_total and new_total > current_stream['total']:
                 old_total = current_stream['total']
                 current_stream['total'] = new_total
-                # Update overall total
                 self.total_bytes = self.total_bytes - old_total + new_total
             
             # Update downloaded bytes
@@ -439,7 +521,9 @@ class DownloadProgress:
                     progress.remove_task(self.task)
                     self.task = None
                 self.completed = True
-                console.print(f"[green]✓[/green] Download completed!")
+                console.print(f"[green]✓[/green] Download completed: {self.current_filename}")
+                if self.format_info:
+                    console.print(f"[green]✓[/green] Format: {self.format_info}")
         
         elif status == 'processing':
             if not self.task or self.current_stage != 'processing':
@@ -457,6 +541,108 @@ class DownloadProgress:
                 description=f"[bold yellow]Processing: {escape(str(status_str))}"
             )
 
+def convert_video(input_path: str, output_path: str, progress: Progress, verbose: bool = False) -> bool:
+    """Convert video to H.264/AAC using ffmpeg-python"""
+    try:
+        # Create a temporary path for intermediate files
+        temp_path = input_path + '.converting.mp4'
+        
+        # Get video information
+        probe = ffmpeg.probe(input_path)
+        video_info = next(s for s in probe['streams'] if s['codec_type'] == 'video')
+        audio_info = next(s for s in probe['streams'] if s['codec_type'] == 'audio')
+        
+        # Get total duration for progress calculation
+        duration = float(probe['format']['duration'])
+        
+        if verbose:
+            console.print(f"[dim]Debug: Input video codec: {video_info.get('codec_name')}[/dim]")
+            console.print(f"[dim]Debug: Input audio codec: {audio_info.get('codec_name')}[/dim]")
+            console.print(f"[dim]Debug: Video duration: {duration:.2f} seconds[/dim]")
+        
+        # Always convert video to H.264
+        video_args = {
+            'c:v': 'libx264',
+            'preset': 'slow',
+            'crf': '18',
+            'pix_fmt': 'yuv420p'  # Ensure compatibility
+        }
+        
+        # Convert audio to AAC if it's not already
+        audio_args = {
+            'c:a': 'copy' if audio_info['codec_name'] == 'aac' else 'aac',
+            'b:a': '192k'
+        }
+        
+        # Combine settings
+        output_args = {**video_args, **audio_args}
+        
+        # Add progress reporting
+        output_args['stats'] = None
+        output_args['progress'] = 'pipe:2'  # Send progress to stderr
+        
+        # Run the conversion
+        task_id = progress.add_task("[bold yellow]Converting video to H.264/AAC...", total=100)
+        
+        try:
+            stream = ffmpeg.input(input_path)
+            stream = ffmpeg.output(stream, temp_path, **output_args)
+            if verbose:
+                console.print(f"[dim]Debug: FFmpeg command: {' '.join(ffmpeg.compile(stream))}[/dim]")
+            
+            process = ffmpeg.run_async(stream, pipe_stderr=True, overwrite_output=True)
+            
+            # Parse FFmpeg progress output
+            pattern = re.compile(r'time=(\d+:\d+:\d+.\d+)')
+            while True:
+                line = process.stderr.readline().decode('utf-8', errors='ignore')
+                if not line:
+                    break
+                
+                # Extract time progress
+                match = pattern.search(line)
+                if match:
+                    time_str = match.group(1)
+                    h, m, s = time_str.split(':')
+                    current_time = float(h) * 3600 + float(m) * 60 + float(s)
+                    percentage = min((current_time / duration) * 100, 99.9)
+                    
+                    # Update progress bar
+                    progress.update(
+                        task_id,
+                        completed=percentage,
+                        description=f"[bold yellow]Converting: {percentage:.1f}% ({time_str})"
+                    )
+                elif verbose and ('error' in line.lower() or 'warning' in line.lower()):
+                    console.print(f"[dim]Debug: FFmpeg: {line.strip()}[/dim]")
+            
+            # Wait for completion
+            process.wait()
+            
+            if process.returncode == 0:
+                # Move the converted file to the final destination
+                if os.path.exists(output_path):
+                    os.remove(output_path)
+                os.rename(temp_path, output_path)
+                
+                progress.update(task_id, completed=100, description="[bold green]✓ Video conversion completed!")
+                return True
+            else:
+                raise ffmpeg.Error("FFmpeg process failed", "", "")
+            
+        except ffmpeg.Error as e:
+            error_message = e.stderr.decode() if e.stderr else str(e)
+            progress.update(task_id, description=f"[bold red]✗ Conversion failed: {error_message}")
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            return False
+        finally:
+            progress.remove_task(task_id)
+            
+    except Exception as e:
+        console.print(f"[red]Error during conversion:[/red] {str(e)}")
+        return False
+
 def get_yt_dlp_opts(progress: Progress, post_process: bool = False) -> Tuple[Dict, DownloadProgress]:
     download_progress = DownloadProgress()
     
@@ -466,15 +652,8 @@ def get_yt_dlp_opts(progress: Progress, post_process: bool = False) -> Tuple[Dic
         'quiet': True,
         'no_warnings': True,
         'merge_output_format': 'mp4',  # Always merge to mp4
+        'postprocessor_args': {}  # Remove FFmpeg settings as we'll handle conversion ourselves
     }
-    
-    if post_process:
-        opts.update({
-            'postprocessors': [{
-                'key': 'FFmpegVideoConvertor',
-                'preferedformat': 'mp4',
-            }],
-        })
     
     return opts, download_progress
 
@@ -490,6 +669,15 @@ def make_json_serializable(obj):
         return [make_json_serializable(item) for item in obj]
     else:
         return str(obj)
+
+def sanitize_filename(filename: str) -> str:
+    """Sanitize filename to avoid issues with special characters"""
+    # First, handle full-width characters
+    filename = filename.replace('：', ':')  # Convert full-width colon to regular colon
+    # Then replace all problematic characters
+    filename = re.sub(r'[<>:"/\\|?*\n\r]', '-', filename)  # Use hyphen for all replacements
+    filename = ' '.join(filename.split())  # Normalize whitespace
+    return filename.strip()
 
 @app.command()
 def main(
@@ -577,19 +765,11 @@ def main(
             # Don't ask about conversion for separate streams, just ensure proper merging
             if needs_video_conversion or needs_audio_conversion:
                 ydl_opts['postprocessors'] = []
-                if needs_video_conversion:
-                    ydl_opts['postprocessors'].append({
-                        'key': 'FFmpegVideoConvertor',
-                        'preferedformat': 'mp4',
-                        'keepvideo': True,
-                    })
-                if needs_audio_conversion:
-                    ydl_opts['postprocessors'].append({
-                        'key': 'FFmpegExtractAudio',
-                        'preferredcodec': 'aac',
-                        'preferredquality': '0',
-                        'keepvideo': True,
-                    })
+                # Only add the merger, we'll handle conversion later
+                ydl_opts['postprocessors'].append({
+                    'key': 'FFmpegVideoRemuxer',
+                    'preferedformat': 'mp4'
+                })
         elif needs_video_conversion or needs_audio_conversion:
             # Only ask about conversion for combined formats
             convert = Confirm.ask(
@@ -598,19 +778,11 @@ def main(
             )
             if convert:
                 ydl_opts['postprocessors'] = []
-                if needs_video_conversion:
-                    ydl_opts['postprocessors'].append({
-                        'key': 'FFmpegVideoConvertor',
-                        'preferedformat': 'mp4',
-                        'keepvideo': True,
-                    })
-                if needs_audio_conversion:
-                    ydl_opts['postprocessors'].append({
-                        'key': 'FFmpegExtractAudio',
-                        'preferredcodec': 'aac',
-                        'preferredquality': '0',
-                        'keepvideo': True,
-                    })
+                # Only add the merger, we'll handle conversion later
+                ydl_opts['postprocessors'].append({
+                    'key': 'FFmpegVideoRemuxer',
+                    'preferedformat': 'mp4'
+                })
 
         # Finally, handle the download with its own progress context
         ydl_opts.update({
@@ -628,12 +800,16 @@ def main(
             'forceprint': {},
             'print_to_file': {},
             'outtmpl': {
-                'default': '%(title)s [%(id)s].%(ext)s',
-                'chapter': '%(title)s - %(section_number)03d %(section_title)s [%(id)s].%(ext)s'
+                'default': sanitize_filename('%(title)s [%(id)s].%(ext)s'),
+                'chapter': sanitize_filename('%(title)s - %(section_number)03d %(section_title)s [%(id)s].%(ext)s')
             },
             'format': ydl_opts['format'],
             'merge_output_format': 'mp4',
             'keepvideo': True,
+            'postprocessor_args': {
+                'FFmpegVideoConvertor': ['-c:v', 'libx264', '-preset', 'fast', '-crf', '18'],
+                'FFmpegVideoRemuxer': ['-c:v', 'copy', '-c:a', 'copy']
+            }
         })
 
         with progress:
@@ -669,6 +845,47 @@ def main(
                         
                         # Do the download
                         ydl.download([url])
+                        
+                        # Handle conversion if needed
+                        if needs_video_conversion or needs_audio_conversion:
+                            # Get base output path without extension
+                            output_base = os.path.splitext(ydl.prepare_filename(info))[0]
+                            if verbose:
+                                console.print(f"[dim]Debug: Base output path: {output_base}[/dim]")
+                            
+                            # Look for the actual file with any supported extension
+                            output_dir = os.path.dirname(output_base) or '.'
+                            base_name = os.path.basename(output_base)
+                            
+                            # Find the merged output file
+                            for ext in ['.mp4', '.webm', '.mkv']:
+                                potential_file = base_name + ext
+                                full_path = os.path.join(output_dir, potential_file)
+                                if os.path.exists(full_path):
+                                    if verbose:
+                                        console.print(f"[dim]Debug: Found merged file: {full_path}[/dim]")
+                                    
+                                    # Create temporary path for conversion
+                                    temp_path = full_path + '.original'
+                                    os.rename(full_path, temp_path)
+                                    
+                                    # Always output as MP4
+                                    final_output = output_base + '.mp4'
+                                    
+                                    if convert_video(temp_path, final_output, progress, verbose):
+                                        os.remove(temp_path)
+                                        console.print(f"[green]✓[/green] Successfully converted video to H.264/AAC")
+                                    else:
+                                        # Restore original file if conversion fails
+                                        if os.path.exists(final_output):
+                                            os.remove(final_output)
+                                        os.rename(temp_path, full_path)
+                                        console.print("[yellow]Warning:[/yellow] Conversion failed, keeping original format")
+                                    break
+                            else:
+                                console.print("[yellow]Warning:[/yellow] Could not find merged output file for conversion")
+                                if verbose:
+                                    console.print(f"[dim]Debug: Available files: {os.listdir(output_dir)}[/dim]")
                         
                         # Clean up temporary files
                         if len(selected_formats) > 1:

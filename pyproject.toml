@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "yt-dlp-helper"
-version = "0.1.0"
-description = "A beautiful command-line wrapper for yt-dlp with a rich interface"
+version = "0.1.2"
+description = "A wrapper for yt-dlp that downloads best quality, and ensures it's in H.264"
 readme = "README.md"
 authors = [
     { name = "Isaac Gutekunst", email = "" }
@@ -22,6 +22,7 @@ dependencies = [
     "rich",
     "yt-dlp",
     "requests",
+    "ffmpeg-python",
 ]
 
 [project.urls]
